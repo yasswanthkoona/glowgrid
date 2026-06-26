@@ -1,0 +1,1601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GlowGrid Profit Command</title>
+<meta name="description" content="Margin, P&L, returns and ad-budget command center for GlowGrid." />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%2339E6C3'/><rect x='30' y='30' width='40' height='40' rx='10' fill='%230B0E14'/></svg>" />
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0E14; }
+  #root { min-height: 100vh; }
+  /* simple loading state before React mounts */
+  .gg-boot { color:#8A95A8; font-family: system-ui, sans-serif; display:flex; min-height:100vh; align-items:center; justify-content:center; }
+</style>
+<!-- React + ReactDOM (production UMD builds) -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel standalone so the JSX below runs directly in the browser -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><div class="gg-boot">Loading GlowGrid…</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+// ---------------------------------------------------------------------------
+// GlowGrid Profit Command — a margin & operations dashboard for a Shopify
+// dropshipping store selling premium gaming accessories into the Indian market.
+// Costs accounted for: CJ product + shipping + custom packaging, Razorpay
+// gateway fee (2% + 18% GST), Shopify overhead per order, and an RTO/returns
+// buffer that India COD stores cannot ignore.
+// ---------------------------------------------------------------------------
+
+const C = {
+  bg: "#0B0E14",
+  panel: "#121722",
+  panel2: "#0F141D",
+  line: "#1F2733",
+  text: "#E8EDF5",
+  dim: "#8A95A8",
+  faint: "#5A6478",
+  glow: "#39E6C3",   // signature mint-glow accent
+  glow2: "#7C5CFF",  // violet secondary
+  green: "#34D399",
+  orange: "#FBBF24",
+  red: "#F87171",
+};
+
+const RZP_RATE = 0.02 * 1.18; // 2% + 18% GST on the fee => 2.36%
+const GOOD = 500;             // ₹ avg profit/order => green
+const LOW = 1;                // above 0 but under GOOD => orange
+
+const money = (n) =>
+  "₹" + (Math.round(n * 100) / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+
+// Compact INR for tight chart labels: ₹1.2L, ₹8.5k, ₹450
+const fmtCompact = (n) => {
+  const sign = n < 0 ? "–" : "";
+  const a = Math.abs(n);
+  if (a >= 100000) return sign + "₹" + (a / 100000).toFixed(a >= 1000000 ? 0 : 1) + "L";
+  if (a >= 1000) return sign + "₹" + (a / 1000).toFixed(a >= 10000 ? 0 : 1) + "k";
+  return sign + "₹" + Math.round(a);
+};
+
+// ---- profit math ----------------------------------------------------------
+function compute(p) {
+  const landed = num(p.product) + num(p.shipping) + num(p.packaging);
+  const overhead = num(p.overhead);
+  const sell = num(p.sell);
+  const gatewayFee = sell * RZP_RATE;
+  const rtoBuffer = sell * (num(p.rtoPct) / 100);
+  const totalCost = landed + overhead + gatewayFee + rtoBuffer;
+  const profit = sell - totalCost;
+  const margin = sell > 0 ? (profit / sell) * 100 : 0;
+  const markup = landed > 0 ? sell / landed : 0;
+  return { landed, overhead, gatewayFee, rtoBuffer, totalCost, profit, margin, markup };
+}
+function num(v) {
+  const n = parseFloat(v);
+  return isFinite(n) ? n : 0;
+}
+function band(profit) {
+  if (profit < 0) return "red";
+  if (profit < GOOD) return "orange";
+  return "green";
+}
+const bandColor = { green: C.green, orange: C.orange, red: C.red };
+const bandLabel = { green: "Healthy", orange: "Thin", red: "Loss" };
+
+// Suggest a price that clears the GOOD profit target after all % fees.
+function suggestPrice(p, target = GOOD) {
+  const landed = num(p.product) + num(p.shipping) + num(p.packaging);
+  const overhead = num(p.overhead);
+  const denom = 1 - RZP_RATE - num(p.rtoPct) / 100;
+  if (denom <= 0) return 0;
+  const raw = (landed + overhead + target) / denom;
+  return Math.ceil(raw / 10) * 10 - 1; // charm price → …9
+}
+
+// ---- ad economics ---------------------------------------------------------
+// Per-order profit BEFORE ads is what each sale contributes toward ad cost.
+// Max CPA = the most you can pay to acquire one order before the product loses money.
+// Break-even ROAS = revenue you must earn per ₹1 of ad spend to not lose money.
+function adEconomics(p) {
+  const c = compute(p);
+  const sell = num(p.sell);
+  const contributionPerOrder = c.profit; // profit before ad cost
+  const maxCPA = contributionPerOrder;   // pay up to this much per sale = break-even
+  const cpaForGood = contributionPerOrder - GOOD; // CPA that still leaves GOOD profit
+  const breakevenROAS = maxCPA > 0 && sell > 0 ? sell / maxCPA : Infinity;
+  const goodROAS = cpaForGood > 0 && sell > 0 ? sell / cpaForGood : Infinity;
+  return { contributionPerOrder, maxCPA, cpaForGood, breakevenROAS, goodROAS, sell };
+}
+
+// ---- sales-realized economics --------------------------------------------
+// A delivered order earns full per-order profit. A returned order means you ate
+// the landed cost + shipping (no revenue, no fee) — a real loss. Pending orders
+// count provisionally at full profit (assumed delivered until marked otherwise).
+function saleProfit(sale, prod) {
+  if (!prod) return 0;
+  const c = compute(prod);
+  if (sale.status === "returned") {
+    // Loss = what you spent getting it out the door. Prepaid returns usually
+    // refund revenue too; COD returns never collected revenue. Either way the
+    // out-of-pocket loss is product + shipping (packaging often reusable, but
+    // count it to stay conservative).
+    return -(num(prod.product) + num(prod.shipping) + num(prod.packaging));
+  }
+  // delivered or pending: full realized profit (no RTO buffer — this is actual)
+  const sell = num(prod.sell);
+  const gatewayFee = sell * RZP_RATE;
+  return sell - c.landed - num(prod.overhead) - gatewayFee;
+}
+function realizedProfit(salesList, products) {
+  if (!products) return 0;
+  const byId = Object.fromEntries(products.map((p) => [p.id, p]));
+  return salesList.reduce((s, sale) => s + saleProfit(sale, byId[sale.productId]), 0);
+}
+function rtoStats(salesList) {
+  let delivered = 0, returned = 0, pending = 0, cod = 0, prepaid = 0;
+  for (const s of salesList) {
+    if (s.status === "delivered") delivered++;
+    else if (s.status === "returned") returned++;
+    else pending++;
+    if (s.channel === "cod") cod++; else prepaid++;
+  }
+  const settled = delivered + returned;
+  const rtoRate = settled > 0 ? (returned / settled) * 100 : null;
+  // COD-specific RTO (the number that actually matters in India)
+  const codSettled = salesList.filter((s) => s.channel === "cod" && s.status !== "pending");
+  const codReturned = codSettled.filter((s) => s.status === "returned").length;
+  const codRtoRate = codSettled.length > 0 ? (codReturned / codSettled.length) * 100 : null;
+  return { delivered, returned, pending, cod, prepaid, settled, rtoRate, codRtoRate, total: salesList.length };
+}
+
+// ---- expense categories ---------------------------------------------------
+const EXPENSE_CATEGORIES = [
+  { id: "subscriptions", label: "Shopify & app subscriptions" },
+  { id: "tools", label: "Domain / branding / tools" },
+  { id: "packaging", label: "CJ packaging & product extras" },
+  { id: "shipping", label: "Shipping / customs / misc fees" },
+  { id: "other", label: "Other" },
+];
+const catLabel = (id) => (EXPENSE_CATEGORIES.find((c) => c.id === id) || { label: "Other" }).label;
+
+// ---- P&L statement --------------------------------------------------------
+// Builds a real profit-and-loss breakdown for a month from its sales + expenses.
+// Revenue counts collected sales (delivered/pending). COGS, gateway fees, and
+// return losses are split out so the operating picture is transparent.
+function buildPnL(monthSales, products, monthExpenses, adSpend) {
+  const byId = Object.fromEntries((products || []).map((p) => [p.id, p]));
+  let revenue = 0, cogs = 0, gateway = 0, returnLoss = 0;
+  for (const s of monthSales) {
+    const p = byId[s.productId];
+    if (!p) continue;
+    const sell = num(p.sell);
+    const landed = num(p.product) + num(p.shipping) + num(p.packaging);
+    if (s.status === "returned") {
+      // No revenue collected/kept; you ate the product + shipping + packaging.
+      returnLoss += landed;
+    } else {
+      revenue += sell;
+      cogs += landed;
+      gateway += sell * RZP_RATE;
+    }
+  }
+  const grossProfit = revenue - cogs - gateway - returnLoss;
+
+  // Operating expenses grouped by category
+  const opexByCat = {};
+  let opexTotal = 0;
+  for (const e of monthExpenses) {
+    const amt = num(e.amount);
+    opexByCat[e.category] = (opexByCat[e.category] || 0) + amt;
+    opexTotal += amt;
+  }
+
+  const operatingProfit = grossProfit - opexTotal;
+  const netProfit = operatingProfit - adSpend;
+  const netMargin = revenue > 0 ? (netProfit / revenue) * 100 : 0;
+
+  return { revenue, cogs, gateway, returnLoss, grossProfit, opexByCat, opexTotal, operatingProfit, adSpend, netProfit, netMargin };
+}
+
+// ---- CSV export / import --------------------------------------------------
+function toCSV(rows) {
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return rows.map((r) => r.map(esc).join(",")).join("\n");
+}
+function buildSalesCSV(sales, products) {
+  const byId = Object.fromEntries(products.map((p) => [p.id, p]));
+  const header = ["date", "product", "channel", "status", "sell_price", "realized_profit"];
+  const rows = sales.map((s) => {
+    const p = byId[s.productId];
+    return [s.date, p ? p.name : "(deleted)", s.channel, s.status, p ? num(p.sell) : "", Math.round(saleProfit(s, p))];
+  });
+  return toCSV([header, ...rows]);
+}
+function buildProductsCSV(products) {
+  const header = ["name", "product_cost", "shipping", "packaging", "overhead", "rto_pct", "sell_price", "profit_per_order", "margin_pct"];
+  const rows = products.map((p) => {
+    const c = compute(p);
+    return [p.name, num(p.product), num(p.shipping), num(p.packaging), num(p.overhead), num(p.rtoPct), num(p.sell), Math.round(c.profit), c.margin.toFixed(1)];
+  });
+  return toCSV([header, ...rows]);
+}
+function buildExpensesCSV(expenses) {
+  const header = ["date", "category", "label", "amount"];
+  const rows = (expenses || []).map((e) => [e.date, catLabel(e.category), e.label || "", num(e.amount)]);
+  return toCSV([header, ...rows]);
+}
+function downloadCSV(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ---- persistence (browser localStorage) -----------------------------------
+async function loadKey(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw != null ? JSON.parse(raw) : fallback;
+  } catch (e) {
+    console.error("load failed", key, e);
+    return fallback;
+  }
+}
+async function saveKey(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    console.error("save failed", key, e);
+  }
+}
+
+const DEFAULT_DRAFT = {
+  name: "",
+  product: "",
+  shipping: "",
+  packaging: "",
+  overhead: "20",
+  rtoPct: "10",
+  sell: "",
+};
+
+const SEED_PRODUCTS = [
+  { id: "seed1", name: "Oversized RGB Gaming Mouse Pad", product: "250", shipping: "120", packaging: "80", overhead: "20", rtoPct: "10", sell: "999" },
+  { id: "seed2", name: "GlowGrid ErgoRest Wrist Rest", product: "180", shipping: "90", packaging: "60", overhead: "20", rtoPct: "10", sell: "699" },
+];
+
+function App() {
+  const [tab, setTab] = useState("calc");
+  const [draft, setDraft] = useState(DEFAULT_DRAFT);
+  const [editingId, setEditingId] = useState(null);
+  const [products, setProducts] = useState(null);
+  const [months, setMonths] = useState(null); // { "2026-06": { adSpend, label } }
+  const [sales, setSales] = useState(null);    // [{ id, productId, date, channel, status }]
+  const [expenses, setExpenses] = useState(null); // [{ id, date, category, label, amount }]
+  const [activeMonth, setActiveMonth] = useState(currentMonthKey());
+  const [notes, setNotes] = useState(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [ready, setReady] = useState(false);
+
+  // hydrate
+  useEffect(() => {
+    (async () => {
+      const [pp, mm, nn, ss, ee] = await Promise.all([
+        loadKey("gg:products", SEED_PRODUCTS),
+        loadKey("gg:months", {}),
+        loadKey("gg:notes", []),
+        loadKey("gg:sales", []),
+        loadKey("gg:expenses", []),
+      ]);
+      setProducts(pp);
+      setMonths(mm);
+      setNotes(nn);
+      setSales(ss);
+      setExpenses(ee);
+      setReady(true);
+    })();
+  }, []);
+
+  useEffect(() => { if (ready) saveKey("gg:products", products); }, [products, ready]);
+  useEffect(() => { if (ready) saveKey("gg:months", months); }, [months, ready]);
+  useEffect(() => { if (ready) saveKey("gg:notes", notes); }, [notes, ready]);
+  useEffect(() => { if (ready) saveKey("gg:sales", sales); }, [sales, ready]);
+  useEffect(() => { if (ready) saveKey("gg:expenses", expenses); }, [expenses, ready]);
+
+  const calc = useMemo(() => compute(draft), [draft]);
+  const calcBand = band(calc.profit);
+
+  // ---- product CRUD ----
+  function saveProduct() {
+    if (!draft.name.trim()) return;
+    if (editingId) {
+      setProducts((arr) => arr.map((p) => (p.id === editingId ? { ...p, ...draft } : p)));
+      setEditingId(null);
+    } else {
+      setProducts((arr) => [...arr, { ...draft, id: "p" + Date.now() }]);
+    }
+    setDraft(DEFAULT_DRAFT);
+  }
+  function editProduct(p) {
+    setDraft({ name: p.name, product: p.product, shipping: p.shipping, packaging: p.packaging, overhead: p.overhead, rtoPct: p.rtoPct, sell: p.sell });
+    setEditingId(p.id);
+    setTab("calc");
+  }
+  function removeProduct(id) {
+    setProducts((arr) => arr.filter((p) => p.id !== id));
+    setSales((arr) => arr.filter((s) => s.productId !== id));
+    if (editingId === id) { setEditingId(null); setDraft(DEFAULT_DRAFT); }
+  }
+
+  // ---- sales CRUD ----
+  function addSale({ productId, date, channel, status }) {
+    setSales((arr) => [
+      { id: "s" + Date.now() + Math.random().toString(36).slice(2, 6), productId, date, channel, status },
+      ...arr,
+    ]);
+  }
+  function updateSale(id, patch) {
+    setSales((arr) => arr.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  }
+  function removeSale(id) {
+    setSales((arr) => arr.filter((s) => s.id !== id));
+  }
+
+  // ---- expense CRUD ----
+  function addExpense({ date, category, label, amount }) {
+    setExpenses((arr) => [
+      { id: "e" + Date.now() + Math.random().toString(36).slice(2, 6), date, category, label, amount },
+      ...arr,
+    ]);
+  }
+  function removeExpense(id) {
+    setExpenses((arr) => arr.filter((e) => e.id !== id));
+  }
+
+  // ---- month figures ----
+  const m = (months && months[activeMonth]) || { adSpend: "" };
+  function setMonthField(field, val) {
+    setMonths((mm) => ({ ...mm, [activeMonth]: { ...(mm[activeMonth] || {}), [field]: val } }));
+  }
+
+  // Sales restricted to the active month
+  const monthSales = useMemo(
+    () => (sales || []).filter((s) => (s.date || "").slice(0, 7) === activeMonth),
+    [sales, activeMonth]
+  );
+
+  // Expenses restricted to the active month
+  const monthExpenses = useMemo(
+    () => (expenses || []).filter((e) => (e.date || "").slice(0, 7) === activeMonth),
+    [expenses, activeMonth]
+  );
+
+  const productProfit = useMemo(
+    () => realizedProfit(monthSales, products),
+    [monthSales, products]
+  );
+  const unitsTotal = monthSales.length;
+  const adSpend = num(m.adSpend);
+  const otherExp = useMemo(
+    () => monthExpenses.reduce((s, e) => s + num(e.amount), 0),
+    [monthExpenses]
+  );
+  const netProfit = productProfit - adSpend - otherExp;
+
+  // Snapshot this month's realized profit + expenses so past months keep real
+  // values in the trend chart even after the catalog changes.
+  useEffect(() => {
+    if (!ready) return;
+    setMonths((mm) => {
+      const cur = mm[activeMonth] || {};
+      if (num(cur.grossSnapshot) === productProfit && num(cur.unitsSnapshot) === unitsTotal && num(cur.opexSnapshot) === otherExp) return mm;
+      return { ...mm, [activeMonth]: { ...cur, grossSnapshot: productProfit, unitsSnapshot: unitsTotal, opexSnapshot: otherExp } };
+    });
+  }, [productProfit, unitsTotal, otherExp, activeMonth, ready]);
+
+  // ---- notes ----
+  function addNote() {
+    if (!noteDraft.trim()) return;
+    setNotes((n) => [{ id: "n" + Date.now(), text: noteDraft.trim(), done: false }, ...n]);
+    setNoteDraft("");
+  }
+  function toggleNote(id) { setNotes((n) => n.map((x) => (x.id === id ? { ...x, done: !x.done } : x))); }
+  function delNote(id) { setNotes((n) => n.filter((x) => x.id !== id)); }
+
+  if (!ready) {
+    return (
+      <div style={{ ...page, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ color: C.dim }}>Loading your store data…</span>
+      </div>
+    );
+  }
+
+  return (
+    <div style={page}>
+      <style>{css}</style>
+
+      {/* Header */}
+      <header style={header}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={logoMark}>
+            <span style={{ display: "block", width: 14, height: 14, borderRadius: 4, background: C.bg, boxShadow: `0 0 0 2px ${C.glow}` }} />
+          </div>
+          <div>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 19, letterSpacing: "-0.02em" }}>
+              GlowGrid <span style={{ color: C.glow }}>Profit Command</span>
+            </div>
+            <div style={{ fontSize: 11.5, color: C.faint, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+              Margin · Operations · Returns — INR
+            </div>
+          </div>
+        </div>
+        <nav style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {[["calc", "Calculator"], ["catalog", "Products"], ["sales", "Sales"], ["dash", "Dashboard"]].map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)} style={tabBtn(tab === k)}>{label}</button>
+          ))}
+        </nav>
+      </header>
+
+      <div style={shell} className="gg-shell">
+        {/* MAIN COLUMN */}
+        <main style={{ minWidth: 0 }}>
+          {tab === "calc" && (
+            <Calculator draft={draft} setDraft={setDraft} calc={calc} calcBand={calcBand}
+              onSave={saveProduct} editing={!!editingId}
+              onSuggest={() => setDraft((d) => ({ ...d, sell: String(suggestPrice(d)) }))}
+              onClear={() => { setDraft(DEFAULT_DRAFT); setEditingId(null); }} />
+          )}
+
+          {tab === "catalog" && (
+            <Catalog products={products} sales={sales} onEdit={editProduct} onRemove={removeProduct}
+              onNew={() => { setTab("calc"); setDraft(DEFAULT_DRAFT); setEditingId(null); }} />
+          )}
+
+          {tab === "sales" && (
+            <SalesLog products={products} sales={sales} activeMonth={activeMonth}
+              setActiveMonth={setActiveMonth} onAdd={addSale} onUpdate={updateSale} onRemove={removeSale}
+              onExportSales={() => downloadCSV(`glowgrid-sales-${todayISO()}.csv`, buildSalesCSV(sales, products))}
+              onExportProducts={() => downloadCSV(`glowgrid-products-${todayISO()}.csv`, buildProductsCSV(products))} />
+          )}
+
+          {tab === "dash" && (
+            <Dashboard
+              months={months} activeMonth={activeMonth} setActiveMonth={setActiveMonth}
+              m={m} setMonthField={setMonthField}
+              productProfit={productProfit} adSpend={adSpend} otherExp={otherExp}
+              netProfit={netProfit} unitsTotal={unitsTotal} products={products}
+              monthSales={monthSales} allSales={sales}
+              monthExpenses={monthExpenses} onAddExpense={addExpense} onRemoveExpense={removeExpense}
+              onExportExpenses={() => downloadCSV(`glowgrid-expenses-${todayISO()}.csv`, buildExpensesCSV(expenses))}
+            />
+          )}
+        </main>
+
+        {/* NOTES SIDEBAR — always visible */}
+        <aside style={notesPanel}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <h3 style={asideTitle}>Problem Log</h3>
+            <span style={{ fontSize: 11, color: C.faint }}>{notes.filter((n) => !n.done).length} open</span>
+          </div>
+          <p style={{ fontSize: 12, color: C.faint, margin: "0 0 12px", lineHeight: 1.5 }}>
+            Jot down blockers — supplier delays, RTO spikes, ad issues. Tick when solved.
+          </p>
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            <input value={noteDraft} onChange={(e) => setNoteDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addNote()}
+              placeholder="What's the problem?" style={{ ...input, marginBottom: 0 }} />
+            <button onClick={addNote} style={miniBtn}>Add</button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 380, overflowY: "auto" }}>
+            {notes.length === 0 && <div style={emptyNote}>No problems logged. Clean board.</div>}
+            {notes.map((n) => (
+              <div key={n.id} style={noteCard(n.done)}>
+                <button onClick={() => toggleNote(n.id)} style={checkBox(n.done)} aria-label="toggle">
+                  {n.done ? "✓" : ""}
+                </button>
+                <span style={{ flex: 1, fontSize: 13, lineHeight: 1.4, textDecoration: n.done ? "line-through" : "none", color: n.done ? C.faint : C.text }}>{n.text}</span>
+                <button onClick={() => delNote(n.id)} style={xBtn} aria-label="delete">×</button>
+              </div>
+            ))}
+          </div>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// CALCULATOR
+// ===========================================================================
+function Calculator({ draft, setDraft, calc, calcBand, onSave, editing, onSuggest, onClear }) {
+  const set = (f) => (e) => setDraft((d) => ({ ...d, [f]: e.target.value }));
+  const accent = bandColor[calcBand];
+
+  return (
+    <section>
+      <SectionHead eyebrow="Price builder" title="What it costs you vs. what you charge" />
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }} className="gg-grid2">
+        {/* COST INPUTS — the box you BUY */}
+        <div style={card}>
+          <div style={cardTag("#7C5CFF22", C.glow2)}>YOUR COST · the box you buy</div>
+          <Field label="Product name" value={draft.name} onChange={set("name")} placeholder="e.g. RGB Mouse Pad" text />
+          <Field label="Product cost (CJ)" value={draft.product} onChange={set("product")} prefix="₹" />
+          <Field label="CJ shipping" value={draft.shipping} onChange={set("shipping")} prefix="₹" />
+          <Field label="Custom packaging (CJ)" value={draft.packaging} onChange={set("packaging")} prefix="₹" />
+          <Field label="Overhead / order (Shopify, apps)" value={draft.overhead} onChange={set("overhead")} prefix="₹" />
+          <Field label="RTO / returns buffer" value={draft.rtoPct} onChange={set("rtoPct")} suffix="%" />
+        </div>
+
+        {/* SELL — the box you SELL */}
+        <div style={card}>
+          <div style={cardTag("#39E6C322", C.glow)}>YOUR PRICE · the box you sell</div>
+          <Field label="Selling price" value={draft.sell} onChange={set("sell")} prefix="₹" big />
+          <button onClick={onSuggest} style={suggestBtn}>
+            ⚡ Suggest price for {money(GOOD)}+ profit
+          </button>
+          <div style={{ height: 1, background: C.line, margin: "16px 0" }} />
+          <Row label="Landed cost" value={money(calc.landed)} />
+          <Row label="Razorpay fee (2% + GST)" value={money(calc.gatewayFee)} sub />
+          <Row label="RTO buffer" value={money(calc.rtoBuffer)} sub />
+          <Row label="Overhead" value={money(calc.overhead)} sub />
+          <div style={{ height: 1, background: C.line, margin: "12px 0" }} />
+          <Row label="Total real cost" value={money(calc.totalCost)} bold />
+        </div>
+      </div>
+
+      {/* VERDICT */}
+      <div style={{ ...verdict, borderColor: accent + "55", background: accent + "0E" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          <div style={{ ...signal, background: accent, boxShadow: `0 0 24px ${accent}88` }}>
+            {calcBand === "green" ? "✓" : calcBand === "orange" ? "!" : "✕"}
+          </div>
+          <div>
+            <div style={{ fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", color: accent, fontWeight: 600 }}>
+              {bandLabel[calcBand]} {calcBand === "green" ? "— good to launch" : calcBand === "orange" ? "— margin is thin" : "— you lose money"}
+            </div>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 34, fontWeight: 700, color: accent, letterSpacing: "-0.02em", lineHeight: 1.1 }}>
+              {money(calc.profit)} <span style={{ fontSize: 15, color: C.dim, fontWeight: 500 }}>profit / order</span>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 28, textAlign: "right" }}>
+          <Stat label="Margin" value={calc.margin.toFixed(1) + "%"} />
+          <Stat label="Markup" value={calc.markup ? calc.markup.toFixed(2) + "×" : "—"} />
+        </div>
+      </div>
+
+      {/* AD ECONOMICS — what you can afford to pay for a customer */}
+      <AdEconomics draft={draft} />
+
+      <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+        <button onClick={onSave} style={primaryBtn} disabled={!draft.name.trim()}>
+          {editing ? "Update product" : "Save to products"}
+        </button>
+        <button onClick={onClear} style={ghostBtn}>Clear</button>
+      </div>
+
+      <p style={hint}>
+        Green at {money(GOOD)}+ · orange below that · red at a loss. The suggest button solves
+        backwards through the Razorpay % and your returns buffer so the target survives the fees.
+      </p>
+    </section>
+  );
+}
+
+// ===========================================================================
+// AD ECONOMICS — the numbers that keep paid ads from losing money
+// ===========================================================================
+function AdEconomics({ draft }) {
+  const e = useMemo(() => adEconomics(draft), [draft]);
+  const hasPrice = num(draft.sell) > 0 && e.contributionPerOrder > 0;
+
+  return (
+    <div style={{ ...card, marginTop: 16, borderColor: C.glow2 + "33" }}>
+      <div style={cardTag("#7C5CFF22", C.glow2)}>AD ECONOMICS · before you spend a rupee</div>
+
+      {!hasPrice ? (
+        <div style={{ fontSize: 13.5, color: C.faint, padding: "8px 0" }}>
+          Set a profitable price above and this shows the most you can pay per customer,
+          plus the ROAS your Meta/Instagram ads must hit to stay in the green.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 14 }} className="gg-grid2">
+            <AdStat
+              label="Max you can pay per sale"
+              value={money(e.maxCPA)}
+              hint="Break-even CPA — pay more than this for an order and the product loses money."
+              color={C.glow}
+            />
+            <AdStat
+              label={`Pay this & still keep ${money(GOOD)}`}
+              value={e.cpaForGood > 0 ? money(e.cpaForGood) : "Not possible"}
+              hint={e.cpaForGood > 0 ? "Target CPA — keep your ad cost-per-purchase under this." : "Margin too thin to hit target after ads. Raise price or cut cost."}
+              color={e.cpaForGood > 0 ? C.green : C.red}
+            />
+            <AdStat
+              label="Break-even ROAS"
+              value={isFinite(e.breakevenROAS) ? e.breakevenROAS.toFixed(2) + "×" : "—"}
+              hint="Minimum return-on-ad-spend to not lose money. Below this, kill the ad set."
+              color={C.orange}
+            />
+            <AdStat
+              label={`ROAS for ${money(GOOD)} profit`}
+              value={isFinite(e.goodROAS) ? e.goodROAS.toFixed(2) + "×" : "—"}
+              hint="Aim your campaigns at or above this number."
+              color={C.glow2}
+            />
+          </div>
+          <div style={{ fontSize: 12, color: C.faint, lineHeight: 1.6, marginTop: 14, paddingTop: 14, borderTop: `1px solid ${C.line}` }}>
+            In Meta Ads Manager, watch <strong style={{ color: C.dim }}>Cost per purchase</strong> against your
+            max-CPA, and <strong style={{ color: C.dim }}>Purchase ROAS</strong> against break-even.
+            One sale here contributes <strong style={{ color: C.glow }}>{money(e.contributionPerOrder)}</strong> toward
+            ad cost — that's your whole ad budget per order.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+function AdStat({ label, value, hint, color }) {
+  return (
+    <div style={{ background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
+      <div style={{ fontSize: 11.5, color: C.dim, marginBottom: 6, fontWeight: 500 }}>{label}</div>
+      <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 26, fontWeight: 700, color, letterSpacing: "-0.02em", lineHeight: 1.1 }}>{value}</div>
+      <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.5, marginTop: 6 }}>{hint}</div>
+    </div>
+  );
+}
+
+
+// ===========================================================================
+// PRODUCT CATALOG
+// ===========================================================================
+function Catalog({ products, sales, onEdit, onRemove, onNew }) {
+  const salesByProduct = useMemo(() => {
+    const map = {};
+    (sales || []).forEach((s) => {
+      (map[s.productId] = map[s.productId] || []).push(s);
+    });
+    return map;
+  }, [sales]);
+
+  return (
+    <section>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 18 }}>
+        <SectionHead eyebrow="Catalog" title="Every product, every margin" noMargin />
+        <button onClick={onNew} style={primaryBtn}>+ New product</button>
+      </div>
+
+      {products.length === 0 && <div style={emptyNote}>No products yet. Build one in the calculator.</div>}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {products.map((p) => {
+          const c = compute(p);
+          const accent = bandColor[band(c.profit)];
+          const ps = salesByProduct[p.id] || [];
+          const units = ps.length;
+          const realized = ps.reduce((s, sale) => s + saleProfit(sale, p), 0);
+          const returns = ps.filter((s) => s.status === "returned").length;
+          return (
+            <div key={p.id} style={{ ...prodRow, borderLeft: `3px solid ${accent}` }}>
+              <div style={{ minWidth: 0, flex: "1 1 200px" }}>
+                <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                <div style={{ fontSize: 12, color: C.faint }}>
+                  buy {money(c.landed)} → sell {money(num(p.sell))} · {c.markup.toFixed(2)}×
+                </div>
+              </div>
+
+              <div style={{ textAlign: "right", minWidth: 100 }}>
+                <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 18, color: accent }}>{money(c.profit)}</div>
+                <div style={{ fontSize: 11, color: C.faint }}>{c.margin.toFixed(0)}% / order</div>
+              </div>
+
+              <div style={{ textAlign: "center", minWidth: 70 }}>
+                <div style={{ fontWeight: 700, fontSize: 18 }}>{units}</div>
+                <div style={{ fontSize: 10, color: C.faint, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  sold{returns ? ` · ${returns}↩` : ""}
+                </div>
+              </div>
+
+              <div style={{ textAlign: "right", minWidth: 90 }}>
+                <div style={{ fontSize: 11, color: C.faint }}>realized</div>
+                <div style={{ fontWeight: 600, color: realized >= 0 ? C.green : C.red }}>
+                  {money(realized)}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => onEdit(p)} style={iconBtn}>Edit</button>
+                <button onClick={() => onRemove(p.id)} style={{ ...iconBtn, color: C.red }}>Del</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <p style={{ ...hint, marginTop: 16 }}>
+        Units and realized profit now come from your logged sales. Add sales in the Sales tab —
+        returns count as a loss, so this reflects what you actually made, not the ideal.
+      </p>
+    </section>
+  );
+}
+
+// ===========================================================================
+// SALES LOG + RTO TRACKER + CSV EXPORT
+// ===========================================================================
+function SalesLog({ products, sales, activeMonth, setActiveMonth, onAdd, onUpdate, onRemove, onExportSales, onExportProducts }) {
+  const [form, setForm] = useState({
+    productId: products[0]?.id || "",
+    date: todayISO(),
+    channel: "prepaid",
+    status: "delivered",
+  });
+
+  const byId = useMemo(() => Object.fromEntries(products.map((p) => [p.id, p])), [products]);
+  const monthKeys = monthOptions();
+
+  // Show this month's sales, newest first
+  const list = useMemo(
+    () => (sales || [])
+      .filter((s) => (s.date || "").slice(0, 7) === activeMonth)
+      .sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id)),
+    [sales, activeMonth]
+  );
+
+  const stats = useMemo(() => rtoStats(list), [list]);
+
+  function submit() {
+    if (!form.productId || !form.date) return;
+    onAdd(form);
+    setForm((f) => ({ ...f, date: todayISO() }));
+  }
+
+  const rtoColor = stats.rtoRate == null ? C.dim : stats.rtoRate >= 25 ? C.red : stats.rtoRate >= 12 ? C.orange : C.green;
+
+  return (
+    <section>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 18, flexWrap: "wrap", gap: 12 }}>
+        <SectionHead eyebrow="Sales" title="Log every order, track returns" noMargin />
+        <div style={{ display: "flex", gap: 8 }}>
+          <select value={activeMonth} onChange={(e) => setActiveMonth(e.target.value)} style={select}>
+            {monthKeys.map((k) => <option key={k} value={k}>{monthLabel(k)}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* ENTRY FORM */}
+      <div style={card}>
+        <div style={cardTag("#39E6C322", C.glow)}>NEW SALE</div>
+        {products.length === 0 ? (
+          <div style={{ fontSize: 13.5, color: C.faint }}>Add a product first in the Calculator.</div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 1fr 1fr auto", gap: 10, alignItems: "end" }} className="gg-saleform">
+            <Labeled label="Product">
+              <select value={form.productId} onChange={(e) => setForm((f) => ({ ...f, productId: e.target.value }))} style={formControl}>
+                {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </Labeled>
+            <Labeled label="Date">
+              <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={formControl} />
+            </Labeled>
+            <Labeled label="Channel">
+              <select value={form.channel} onChange={(e) => setForm((f) => ({ ...f, channel: e.target.value }))} style={formControl}>
+                <option value="prepaid">Prepaid</option>
+                <option value="cod">COD</option>
+              </select>
+            </Labeled>
+            <Labeled label="Status">
+              <select value={form.status} onChange={(e) => setForm((f) => ({ ...f, status: e.target.value }))} style={formControl}>
+                <option value="delivered">Delivered</option>
+                <option value="pending">Pending</option>
+                <option value="returned">Returned</option>
+              </select>
+            </Labeled>
+            <button onClick={submit} style={{ ...primaryBtn, height: 40 }}>Add</button>
+          </div>
+        )}
+      </div>
+
+      {/* RTO SUMMARY */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginTop: 16 }} className="gg-grid4">
+        <InsightTile label="Orders this month" value={stats.total} sub={`${stats.pending} pending`} />
+        <div style={tile}>
+          <div style={tileLabel}>Real RTO rate</div>
+          <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, fontWeight: 700, color: rtoColor, letterSpacing: "-0.02em" }}>
+            {stats.rtoRate == null ? "—" : stats.rtoRate.toFixed(0) + "%"}
+          </div>
+          <div style={{ fontSize: 11.5, color: C.faint, marginTop: 2 }}>
+            {stats.settled > 0 ? `${stats.returned} of ${stats.settled} settled` : "no settled orders yet"}
+          </div>
+        </div>
+        <div style={tile}>
+          <div style={tileLabel}>COD return rate</div>
+          <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, fontWeight: 700, color: stats.codRtoRate == null ? C.dim : stats.codRtoRate >= 25 ? C.red : stats.codRtoRate >= 12 ? C.orange : C.green, letterSpacing: "-0.02em" }}>
+            {stats.codRtoRate == null ? "—" : stats.codRtoRate.toFixed(0) + "%"}
+          </div>
+          <div style={{ fontSize: 11.5, color: C.faint, marginTop: 2 }}>the India COD killer</div>
+        </div>
+        <InsightTile label="Prepaid / COD" value={`${stats.prepaid}/${stats.cod}`} sub="order split" />
+      </div>
+
+      {stats.rtoRate != null && stats.settled >= 5 && (
+        <div style={{ ...calloutBox, borderColor: rtoColor + "44", background: rtoColor + "0E" }}>
+          <span style={{ color: rtoColor, fontWeight: 600 }}>Reality check:</span>{" "}
+          <span style={{ color: C.dim }}>
+            Your actual return rate is {stats.rtoRate.toFixed(0)}%. If your products' RTO buffer is set
+            lower than this, your margins are optimistic — bump the buffer on the Calculator to match.
+          </span>
+        </div>
+      )}
+
+      {/* EXPORT */}
+      <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
+        <button onClick={onExportSales} style={ghostBtn} disabled={!sales || sales.length === 0}>⬇ Export sales CSV</button>
+        <button onClick={onExportProducts} style={ghostBtn} disabled={products.length === 0}>⬇ Export products CSV</button>
+        <span style={{ fontSize: 12, color: C.faint, alignSelf: "center" }}>Back up your data or open it in a sheet anytime.</span>
+      </div>
+
+      {/* LIST */}
+      <div style={{ marginTop: 18, display: "flex", flexDirection: "column", gap: 8 }}>
+        {list.length === 0 && <div style={emptyNote}>No sales logged for {monthLabel(activeMonth)} yet.</div>}
+        {list.map((s) => {
+          const p = byId[s.productId];
+          const profit = saleProfit(s, p);
+          const stColor = s.status === "returned" ? C.red : s.status === "pending" ? C.orange : C.green;
+          return (
+            <div key={s.id} style={saleRow}>
+              <div style={{ minWidth: 78, fontSize: 12.5, color: C.dim, fontVariantNumeric: "tabular-nums" }}>{fmtDate(s.date)}</div>
+              <div style={{ flex: "1 1 160px", minWidth: 0, fontWeight: 600, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {p ? p.name : "(deleted product)"}
+              </div>
+              <span style={{ ...pill, color: s.channel === "cod" ? C.orange : C.glow, borderColor: (s.channel === "cod" ? C.orange : C.glow) + "44" }}>
+                {s.channel === "cod" ? "COD" : "Prepaid"}
+              </span>
+              <select value={s.status} onChange={(e) => onUpdate(s.id, { status: e.target.value })}
+                style={{ ...formControl, width: 110, padding: "6px 8px", color: stColor, fontWeight: 600 }}>
+                <option value="delivered">Delivered</option>
+                <option value="pending">Pending</option>
+                <option value="returned">Returned</option>
+              </select>
+              <div style={{ minWidth: 80, textAlign: "right", fontWeight: 700, fontFamily: "'Space Grotesk', sans-serif", color: profit >= 0 ? C.green : C.red }}>
+                {money(profit)}
+              </div>
+              <button onClick={() => onRemove(s.id)} style={xBtn} aria-label="delete sale">×</button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+function Labeled({ label, children }) {
+  return (
+    <label style={{ display: "block" }}>
+      <span style={{ display: "block", fontSize: 11.5, color: C.dim, marginBottom: 5, fontWeight: 500 }}>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+// ===========================================================================
+// MONTHLY DASHBOARD
+// ===========================================================================
+function Dashboard({ months, activeMonth, setActiveMonth, m, setMonthField, productProfit, adSpend, otherExp, netProfit, unitsTotal, products, monthSales, allSales, monthExpenses, onAddExpense, onRemoveExpense, onExportExpenses }) {
+  const monthKeys = monthOptions();
+  const netBand = netProfit > 0 ? (netProfit >= GOOD ? "green" : "orange") : "red";
+  const accent = bandColor[netBand];
+
+  // Top seller by units in the active month
+  const topSeller = useMemo(() => {
+    if (!products || products.length === 0) return null;
+    const counts = {};
+    (monthSales || []).forEach((s) => { counts[s.productId] = (counts[s.productId] || 0) + 1; });
+    const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    if (!best) return null;
+    const p = products.find((x) => x.id === best[0]);
+    return p ? { name: p.name, units: best[1] } : null;
+  }, [products, monthSales]);
+
+  const bestMargin = useMemo(() => {
+    if (!products || products.length === 0) return null;
+    return [...products].map((p) => ({ p, c: compute(p) })).sort((a, b) => b.c.margin - a.c.margin)[0];
+  }, [products]);
+
+  // Blended realized profit per order, from actual sales this month
+  const blendedPerOrder = unitsTotal > 0 ? productProfit / unitsTotal : null;
+
+  // Full P&L statement for the active month
+  const pnl = useMemo(
+    () => buildPnL(monthSales, products, monthExpenses, adSpend),
+    [monthSales, products, monthExpenses, adSpend]
+  );
+
+  return (
+    <section>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 18 }}>
+        <SectionHead eyebrow="Operations" title="Monthly profit & loss" noMargin />
+        <select value={activeMonth} onChange={(e) => setActiveMonth(e.target.value)} style={select}>
+          {monthKeys.map((k) => <option key={k} value={k}>{monthLabel(k)}</option>)}
+        </select>
+      </div>
+
+      {/* HERO NET CARD */}
+      <div style={{ ...heroCard, borderColor: accent + "44" }}>
+        <div>
+          <div style={{ fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", color: C.dim }}>Net profit · {monthLabel(activeMonth)}</div>
+          <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 48, letterSpacing: "-0.03em", color: accent, lineHeight: 1.05 }}>
+            {money(netProfit)}
+          </div>
+          <div style={{ fontSize: 13, color: C.faint, marginTop: 4 }}>
+            {pnl.netMargin.toFixed(0)}% net margin · {unitsTotal} orders logged
+          </div>
+        </div>
+        <div style={{ ...signal, width: 56, height: 56, fontSize: 24, background: accent, boxShadow: `0 0 30px ${accent}77` }}>
+          {netBand === "green" ? "✓" : netBand === "orange" ? "!" : "✕"}
+        </div>
+      </div>
+
+      {/* AD SPEND TILE */}
+      <div style={{ ...tile, marginTop: 16 }}>
+        <div style={tileLabel}>Ad spend this month</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ color: C.dim, fontSize: 20 }}>₹</span>
+          <input value={m.adSpend || ""} onChange={(e) => setMonthField("adSpend", e.target.value)}
+            placeholder="0" inputMode="decimal" style={tileInput} />
+        </div>
+      </div>
+
+      {/* ITEMIZED EXPENSES */}
+      <ExpenseManager activeMonth={activeMonth} monthExpenses={monthExpenses}
+        onAdd={onAddExpense} onRemove={onRemoveExpense} onExport={onExportExpenses} opexByCat={pnl.opexByCat} />
+
+      {/* P&L STATEMENT */}
+      <PnLStatement pnl={pnl} monthLabel={monthLabel(activeMonth)} />
+
+      {/* BREAK-EVEN GUARDRAIL */}
+      <BreakEven products={products} adSpend={adSpend} otherExp={otherExp}
+        unitsTotal={unitsTotal} productProfit={productProfit} blendedPerOrder={blendedPerOrder} />
+
+      {/* AD BUDGET PLANNER */}
+      <AdPlanner products={products} blendedPerOrder={blendedPerOrder} />
+
+      {/* PROFIT OVER TIME */}
+      <ProfitChart months={months} products={products} activeMonth={activeMonth}
+        productProfit={productProfit} unitsTotal={unitsTotal} otherExp={otherExp} />
+
+      {/* INSIGHT STRIP */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginTop: 16 }} className="gg-grid3">
+        <InsightTile label="Orders this month" value={unitsTotal} sub="logged sales" />
+        <InsightTile label="Top seller" value={topSeller ? topSeller.units : "—"}
+          sub={topSeller ? topSeller.name : "no sales yet"} />
+        <InsightTile label="Best margin" value={bestMargin ? bestMargin.c.margin.toFixed(0) + "%" : "—"}
+          sub={bestMargin ? bestMargin.p.name : "—"} />
+      </div>
+    </section>
+  );
+}
+
+// ===========================================================================
+// EXPENSE MANAGER — itemized operating costs by category
+// ===========================================================================
+function ExpenseManager({ activeMonth, monthExpenses, onAdd, onRemove, onExport, opexByCat }) {
+  const [form, setForm] = useState({ label: "", amount: "", category: "subscriptions", date: defaultDayInMonth(activeMonth) });
+
+  // keep the date inside the selected month when it changes
+  useEffect(() => {
+    setForm((f) => ({ ...f, date: defaultDayInMonth(activeMonth) }));
+  }, [activeMonth]);
+
+  const total = (monthExpenses || []).reduce((s, e) => s + num(e.amount), 0);
+  const list = [...(monthExpenses || [])].sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+
+  function submit() {
+    if (num(form.amount) <= 0) return;
+    onAdd({ date: form.date, category: form.category, label: form.label.trim() || catLabel(form.category), amount: form.amount });
+    setForm((f) => ({ ...f, label: "", amount: "" }));
+  }
+
+  return (
+    <div style={{ ...card, marginTop: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={cardTag("#FBBF2422", C.orange)}>OPERATING EXPENSES · itemized</div>
+        <button onClick={onExport} style={{ ...iconBtn, padding: "6px 12px" }} disabled={!monthExpenses || monthExpenses.length === 0}>⬇ CSV</button>
+      </div>
+
+      {/* entry form */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1.4fr 1fr 1fr auto", gap: 10, alignItems: "end" }} className="gg-saleform">
+        <Labeled label="What for">
+          <input value={form.label} onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))}
+            placeholder="e.g. Shopify Basic, .com domain" style={formControl}
+            onKeyDown={(e) => e.key === "Enter" && submit()} />
+        </Labeled>
+        <Labeled label="Category">
+          <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} style={formControl}>
+            {EXPENSE_CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+          </select>
+        </Labeled>
+        <Labeled label="Date">
+          <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={formControl} />
+        </Labeled>
+        <Labeled label="Amount">
+          <div style={{ display: "flex", alignItems: "center", background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 10, padding: "0 10px", height: 40 }}>
+            <span style={{ color: C.dim, fontSize: 14 }}>₹</span>
+            <input value={form.amount} onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))}
+              placeholder="0" inputMode="decimal" style={{ ...bareInput, padding: "8px 4px" }}
+              onKeyDown={(e) => e.key === "Enter" && submit()} />
+          </div>
+        </Labeled>
+        <button onClick={submit} style={{ ...primaryBtn, height: 40 }}>Add</button>
+      </div>
+
+      {/* category summary chips */}
+      {total > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
+          {EXPENSE_CATEGORIES.filter((c) => opexByCat[c.id] > 0).map((c) => (
+            <div key={c.id} style={{ ...pill, color: C.dim, borderColor: C.line, display: "flex", gap: 6 }}>
+              {c.label} <strong style={{ color: C.text }}>{money(opexByCat[c.id])}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* line items */}
+      <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+        {list.length === 0 && <div style={emptyNote}>No expenses logged for {monthLabel(activeMonth)} yet.</div>}
+        {list.map((e) => (
+          <div key={e.id} style={expRow}>
+            <div style={{ minWidth: 70, fontSize: 12.5, color: C.dim, fontVariantNumeric: "tabular-nums" }}>{fmtDate(e.date)}</div>
+            <div style={{ flex: "1 1 140px", minWidth: 0, fontWeight: 600, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.label}</div>
+            <span style={{ ...pill, color: C.faint, borderColor: C.line }}>{catLabel(e.category)}</span>
+            <div style={{ minWidth: 80, textAlign: "right", fontWeight: 700, fontFamily: "'Space Grotesk', sans-serif", color: C.orange }}>{money(num(e.amount))}</div>
+            <button onClick={() => onRemove(e.id)} style={xBtn} aria-label="delete expense">×</button>
+          </div>
+        ))}
+      </div>
+
+      {total > 0 && (
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 14, paddingTop: 14, borderTop: `1px solid ${C.line}` }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>Total operating expenses</span>
+          <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 18, color: C.orange }}>{money(total)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// P&L STATEMENT — the full profit-and-loss breakdown
+// ===========================================================================
+function PnLStatement({ pnl, monthLabel }) {
+  const netColor = pnl.netProfit > 0 ? (pnl.netProfit >= GOOD ? C.green : C.orange) : C.red;
+  const hasActivity = pnl.revenue > 0 || pnl.opexTotal > 0 || pnl.adSpend > 0 || pnl.returnLoss > 0;
+
+  return (
+    <div style={{ ...card, marginTop: 16 }}>
+      <div style={cardTag("#39E6C322", C.glow)}>PROFIT & LOSS · {monthLabel}</div>
+
+      {!hasActivity ? (
+        <div style={{ fontSize: 13.5, color: C.faint, padding: "6px 0" }}>
+          Log sales and expenses for this month to see the full P&L breakdown.
+        </div>
+      ) : (
+        <>
+          {/* Revenue */}
+          <PnLLine label="Revenue (collected sales)" value={pnl.revenue} strong />
+          <PnLLine label="Cost of goods (product + shipping + packaging)" value={-pnl.cogs} indent />
+          <PnLLine label="Payment gateway fees (Razorpay + GST)" value={-pnl.gateway} indent />
+          {pnl.returnLoss > 0 && <PnLLine label="Return losses (RTO)" value={-pnl.returnLoss} indent />}
+          <PnLSub label="Gross profit" value={pnl.grossProfit} pct={pnl.revenue > 0 ? (pnl.grossProfit / pnl.revenue) * 100 : 0} />
+
+          {/* Operating expenses */}
+          <div style={{ height: 1, background: C.line, margin: "12px 0" }} />
+          {Object.keys(pnl.opexByCat).length === 0 ? (
+            <PnLLine label="Operating expenses" value={0} indent muted />
+          ) : (
+            EXPENSE_CATEGORIES.filter((c) => pnl.opexByCat[c.id] > 0).map((c) => (
+              <PnLLine key={c.id} label={c.label} value={-pnl.opexByCat[c.id]} indent />
+            ))
+          )}
+          <PnLSub label="Operating profit" value={pnl.operatingProfit} pct={pnl.revenue > 0 ? (pnl.operatingProfit / pnl.revenue) * 100 : 0} />
+
+          {/* Marketing */}
+          <div style={{ height: 1, background: C.line, margin: "12px 0" }} />
+          <PnLLine label="Ad spend (marketing)" value={-pnl.adSpend} indent />
+
+          {/* Net */}
+          <div style={{ height: 2, background: C.line, margin: "14px 0" }} />
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>Net profit</div>
+              <div style={{ fontSize: 11.5, color: C.faint }}>{pnl.netMargin.toFixed(1)}% net margin</div>
+            </div>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 30, fontWeight: 700, color: netColor, letterSpacing: "-0.02em" }}>
+              {money(pnl.netProfit)}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+function PnLLine({ label, value, indent, strong, muted }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "5px 0" }}>
+      <span style={{ fontSize: strong ? 14 : 13, color: muted ? C.faint : strong ? C.text : C.dim, paddingLeft: indent ? 16 : 0, fontWeight: strong ? 600 : 400 }}>{label}</span>
+      <span style={{ fontSize: strong ? 14 : 13, fontWeight: strong ? 700 : 500, color: value < 0 ? C.red : value > 0 ? (strong ? C.text : C.dim) : C.faint, fontVariantNumeric: "tabular-nums" }}>
+        {value < 0 ? "–" + money(Math.abs(value)) : money(value)}
+      </span>
+    </div>
+  );
+}
+function PnLSub({ label, value, pct }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0 4px", marginTop: 4 }}>
+      <span style={{ fontSize: 13.5, fontWeight: 600, color: C.text }}>{label}</span>
+      <span style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <span style={{ fontSize: 11, color: C.faint }}>{pct.toFixed(0)}%</span>
+        <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 15, fontWeight: 700, color: value >= 0 ? C.green : C.red }}>{money(value)}</span>
+      </span>
+    </div>
+  );
+}
+function defaultDayInMonth(monthKey) {
+  const today = todayISO();
+  if (today.slice(0, 7) === monthKey) return today; // current month → today
+  return `${monthKey}-15`; // otherwise mid-month
+}
+function BreakEven({ products, adSpend, otherExp, unitsTotal, productProfit, blendedPerOrder }) {
+  // Prefer the REAL blended profit/order from this month's sales. Fall back to
+  // the catalog's theoretical average only before any sales are logged.
+  const blended = blendedPerOrder != null && unitsTotal > 0
+    ? blendedPerOrder
+    : (products && products.length
+        ? products.reduce((s, p) => s + compute(p).profit, 0) / products.length
+        : 0);
+
+  const totalSpend = adSpend + otherExp;
+  const breakevenUnits = blended > 0 ? Math.ceil(totalSpend / blended) : Infinity;
+  const remaining = Math.max(0, breakevenUnits - unitsTotal);
+  const cleared = unitsTotal >= breakevenUnits && totalSpend > 0;
+  const progress = breakevenUnits > 0 && isFinite(breakevenUnits)
+    ? Math.min(100, (unitsTotal / breakevenUnits) * 100) : 0;
+
+  const accent = totalSpend === 0 ? C.dim : cleared ? C.green : remaining <= 3 ? C.orange : C.red;
+
+  return (
+    <div style={{ ...card, marginTop: 16 }}>
+      <div style={cardTag("#FBBF2422", C.orange)}>BREAK-EVEN GUARDRAIL · is this month's ad spend safe?</div>
+
+      {totalSpend === 0 ? (
+        <div style={{ fontSize: 13.5, color: C.faint, padding: "6px 0" }}>
+          Enter ad spend above to see how many units you must sell to cover it.
+        </div>
+      ) : blended <= 0 ? (
+        <div style={{ fontSize: 13.5, color: C.red, padding: "6px 0" }}>
+          Your products aren't profitable per order yet — fix pricing before spending on ads.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 16, marginBottom: 14 }}>
+            <div>
+              <div style={{ fontSize: 12, color: C.dim, marginBottom: 4 }}>Units to break even on {money(totalSpend)} spend</div>
+              <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 38, fontWeight: 700, color: accent, letterSpacing: "-0.02em", lineHeight: 1 }}>
+                {isFinite(breakevenUnits) ? breakevenUnits : "—"}
+                <span style={{ fontSize: 14, color: C.faint, fontWeight: 500 }}> units</span>
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 12, color: C.dim, marginBottom: 4 }}>{cleared ? "Cleared — now in profit" : "Still need"}</div>
+              <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, fontWeight: 700, color: accent }}>
+                {cleared ? "✓ " + unitsTotal + " sold" : remaining + " more sales"}
+              </div>
+            </div>
+          </div>
+
+          {/* progress bar */}
+          <div style={{ height: 10, borderRadius: 6, background: C.panel2, overflow: "hidden", border: `1px solid ${C.line}` }}>
+            <div style={{ height: "100%", width: progress + "%", background: accent, transition: "width .4s ease", boxShadow: `0 0 12px ${accent}88` }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: C.faint, marginTop: 6 }}>
+            <span>{unitsTotal} sold</span>
+            <span>blended {money(blended)} profit / order</span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// AD BUDGET PLANNER — turn a target CPA + capacity into a real spend plan
+// ===========================================================================
+function AdPlanner({ products, blendedPerOrder }) {
+  // Contribution per order = the whole ad budget a single sale can fund.
+  // Use real blended profit if sales exist; else average the catalog.
+  const contribution = blendedPerOrder != null
+    ? blendedPerOrder
+    : (products && products.length
+        ? products.reduce((s, p) => s + compute(p).profit, 0) / products.length
+        : 0);
+
+  // Sensible default target CPA: leave GOOD profit if possible, else half the contribution.
+  const defaultCPA = contribution > GOOD ? Math.round(contribution - GOOD) : Math.max(0, Math.round(contribution * 0.5));
+
+  const [cpa, setCpa] = useState(String(defaultCPA || 150));
+  const [capacity, setCapacity] = useState("60"); // orders/month you can fulfill
+  const [aggression, setAggression] = useState(2.5); // daily test = CPA × this
+
+  const targetCPA = num(cpa);
+  const orders = num(capacity);
+
+  // Outputs
+  const dailyTest = targetCPA * aggression;          // per ad set, per day
+  const monthlyCap = orders * targetCPA;             // most you'd spend at capacity
+  const profitPerOrderAtCPA = contribution - targetCPA;
+  const monthlyProfit = profitPerOrderAtCPA * orders;
+  const breakevenCPA = contribution;                 // pay more than this = loss
+
+  // The key insight: what selling price makes targetCPA still leave GOOD profit?
+  // Need: (newSell − landed − overhead − newSell*RZP) − targetCPA ≥ GOOD
+  // Using the store's blended landed+overhead as a proxy from current catalog.
+  const avgFixed = products && products.length
+    ? products.reduce((s, p) => s + compute(p).landed + num(p.overhead), 0) / products.length
+    : 0;
+  const neededSell = (avgFixed + targetCPA + GOOD) / (1 - RZP_RATE);
+
+  const cpaBand = targetCPA <= 0 ? "dim"
+    : targetCPA >= breakevenCPA ? "red"
+    : profitPerOrderAtCPA >= GOOD ? "green"
+    : "orange";
+  const cpaColor = { dim: C.dim, green: C.green, orange: C.orange, red: C.red }[cpaBand];
+
+  const verdictText = {
+    green: `At ₹${Math.round(targetCPA)} CPA you keep ${money(profitPerOrderAtCPA)} per order — above your ${money(GOOD)} target.`,
+    orange: `At ₹${Math.round(targetCPA)} CPA you keep ${money(profitPerOrderAtCPA)} per order — profitable but under your ${money(GOOD)} target.`,
+    red: `At ₹${Math.round(targetCPA)} CPA you lose money — every order costs more in ads than it earns. Lower the CPA or raise price.`,
+    dim: "Enter a target cost-per-purchase to plan your spend.",
+  }[cpaBand];
+
+  return (
+    <div style={{ ...card, marginTop: 16, borderColor: C.glow2 + "33" }}>
+      <div style={cardTag("#7C5CFF22", C.glow2)}>AD BUDGET PLANNER · how much to actually spend</div>
+
+      {contribution <= 0 ? (
+        <div style={{ fontSize: 13.5, color: C.red, padding: "6px 0" }}>
+          Your products aren't profitable per order yet, so ads can't work. Fix pricing first —
+          a sale needs to fund its own ad cost.
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: 12.5, color: C.faint, lineHeight: 1.6, marginBottom: 16 }}>
+            One sale can fund up to <strong style={{ color: C.glow }}>{money(breakevenCPA)}</strong> of ad cost
+            before it loses money — that's your ceiling. Pick a realistic target below it.
+          </div>
+
+          {/* INPUTS */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 8 }} className="gg-grid2">
+            <div style={tile}>
+              <div style={tileLabel}>Target cost per purchase (CPA)</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ color: C.dim, fontSize: 20 }}>₹</span>
+                <input value={cpa} onChange={(e) => setCpa(e.target.value)} placeholder="150" inputMode="decimal" style={tileInput} />
+              </div>
+            </div>
+            <div style={tile}>
+              <div style={tileLabel}>Orders you can fulfill / month</div>
+              <input value={capacity} onChange={(e) => setCapacity(e.target.value)} placeholder="60" inputMode="decimal"
+                style={{ ...tileInput, paddingLeft: 0 }} />
+            </div>
+          </div>
+
+          {/* aggression selector */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "14px 0 18px" }}>
+            <span style={{ fontSize: 12.5, color: C.dim }}>Test intensity</span>
+            {[[2, "Cautious"], [2.5, "Standard"], [3, "Aggressive"]].map(([v, label]) => (
+              <button key={v} onClick={() => setAggression(v)}
+                style={{ ...chip, ...(aggression === v ? chipOn : {}) }}>
+                {label} · {v}×
+              </button>
+            ))}
+          </div>
+
+          {/* OUTPUTS */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 14 }} className="gg-grid2">
+            <AdStat label="Daily test budget / ad set" value={money(dailyTest)}
+              hint={`Target CPA × ${aggression} — enough signal to judge an ad set in 3–4 days.`} color={C.glow} />
+            <AdStat label="Monthly cap at capacity" value={money(monthlyCap)}
+              hint={`${orders} orders × ₹${Math.round(targetCPA)} CPA — the most you'd spend if every order came from ads.`} color={C.glow2} />
+            <AdStat label="Profit per order at this CPA" value={money(profitPerOrderAtCPA)}
+              hint="What's left after ad cost on each sale." color={cpaColor} />
+            <AdStat label="Projected monthly ad profit" value={money(monthlyProfit)}
+              hint={`If you hit ${orders} ad-driven orders at this CPA.`} color={monthlyProfit >= 0 ? C.green : C.red} />
+          </div>
+
+          {/* VERDICT */}
+          <div style={{ ...calloutBox, borderColor: cpaColor + "44", background: cpaColor + "0E", marginTop: 16 }}>
+            <span style={{ color: cpaColor, fontWeight: 600 }}>
+              {cpaBand === "green" ? "On target. " : cpaBand === "orange" ? "Workable. " : "Warning. "}
+            </span>
+            <span style={{ color: C.dim }}>{verdictText}</span>
+          </div>
+
+          {/* AOV FIX — the move when CPA is too high to leave GOOD */}
+          {cpaBand !== "green" && targetCPA > 0 && isFinite(neededSell) && (
+            <div style={{ ...calloutBox, borderColor: C.glow + "33", background: C.glow + "0A", marginTop: 12 }}>
+              <span style={{ color: C.glow, fontWeight: 600 }}>The fix: raise order value. </span>
+              <span style={{ color: C.dim }}>
+                To keep {money(GOOD)} profit at a ₹{Math.round(targetCPA)} CPA, your average order needs to sell
+                around <strong style={{ color: C.text }}>{money(neededSell)}</strong>. Get there with a bundle
+                (mousepad + wrist rest), an upsell, or a free-shipping threshold — so each order can afford more ad cost.
+              </span>
+            </div>
+          )}
+
+          <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.6, marginTop: 14, paddingTop: 14, borderTop: `1px solid ${C.line}` }}>
+            Launch plan: run each ad set at the daily test budget for 3–4 days, judge it against your CPA ceiling
+            of {money(breakevenCPA)}, kill losers, and scale winners ~20% at a time. Treat the first week's spend as tuition for data.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// PROFIT OVER TIME — bar chart of net profit across recent months
+// ===========================================================================
+function ProfitChart({ months, products, activeMonth, productProfit, otherExp }) {
+  // Net profit per month = realized product profit − adSpend − operating expenses.
+  // Each month stores grossSnapshot and opexSnapshot, so history stays accurate.
+  // The active month uses the live figures passed from the dashboard.
+  const series = useMemo(() => {
+    const keys = monthOptions().slice(0, 6).reverse(); // oldest → newest, last 6
+    return keys.map((k) => {
+      const mm = (months && months[k]) || {};
+      const ad = num(mm.adSpend);
+      const opex = k === activeMonth ? num(otherExp) : num(mm.opexSnapshot);
+      const gross = k === activeMonth ? productProfit : num(mm.grossSnapshot);
+      const net = gross - ad - opex;
+      return { key: k, net, hasData: ad > 0 || opex > 0 || gross !== 0 || num(mm.unitsSnapshot) > 0 };
+    });
+  }, [months, activeMonth, productProfit, otherExp]);
+
+  const vals = series.map((s) => s.net);
+  const max = Math.max(1, ...vals.map((v) => Math.abs(v)));
+  const anyData = series.some((s) => s.hasData);
+
+  return (
+    <div style={{ ...card, marginTop: 16 }}>
+      <div style={cardTag("#7C5CFF22", C.glow2)}>PROFIT OVER TIME · last 6 months</div>
+      {!anyData ? (
+        <div style={{ fontSize: 13.5, color: C.faint, padding: "6px 0" }}>
+          Log ad spend and expenses across months and your profit trend appears here.
+        </div>
+      ) : (
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 12, height: 180, paddingTop: 10 }}>
+          {series.map((s) => {
+            const h = (Math.abs(s.net) / max) * 130;
+            const pos = s.net >= 0;
+            const col = !s.hasData ? C.line : pos ? C.green : C.red;
+            const isActive = s.key === activeMonth;
+            return (
+              <div key={s.key} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", height: "100%", justifyContent: "flex-end", gap: 6 }}>
+                <div style={{ fontSize: 10.5, color: pos ? C.green : C.red, fontWeight: 600, opacity: s.hasData ? 1 : 0.3 }}>
+                  {s.hasData ? fmtCompact(s.net) : ""}
+                </div>
+                <div style={{
+                  width: "100%", maxWidth: 46, height: Math.max(h, s.hasData ? 4 : 2),
+                  background: col, borderRadius: 6, opacity: s.hasData ? 1 : 0.25,
+                  border: isActive ? `2px solid ${C.glow}` : "none",
+                  boxShadow: s.hasData ? `0 0 14px ${col}55` : "none", transition: "height .4s ease",
+                }} />
+                <div style={{ fontSize: 10.5, color: isActive ? C.glow : C.faint, fontWeight: isActive ? 700 : 500, textAlign: "center" }}>
+                  {monthLabel(s.key).split(" ")[0]}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.5, marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.line}` }}>
+        Bars show net profit per month (gross product profit minus that month's ad spend and expenses).
+        The active month uses your live sales; past months reflect what you logged.
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// SMALL COMPONENTS
+// ===========================================================================
+function SectionHead({ eyebrow, title, noMargin }) {
+  return (
+    <div style={{ marginBottom: noMargin ? 0 : 20 }}>
+      <div style={{ fontSize: 11.5, letterSpacing: "0.14em", textTransform: "uppercase", color: C.glow, fontWeight: 600, marginBottom: 6 }}>{eyebrow}</div>
+      <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 25, fontWeight: 700, letterSpacing: "-0.02em", margin: 0 }}>{title}</h2>
+    </div>
+  );
+}
+function Field({ label, value, onChange, prefix, suffix, placeholder, text, big }) {
+  return (
+    <label style={{ display: "block", marginBottom: 12 }}>
+      <span style={fieldLabel}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 10, padding: big ? "4px 12px" : "2px 12px" }}>
+        {prefix && <span style={{ color: C.dim, fontSize: big ? 22 : 15, marginRight: 4 }}>{prefix}</span>}
+        <input value={value} onChange={onChange} placeholder={placeholder || (text ? "" : "0")}
+          inputMode={text ? "text" : "decimal"}
+          style={{ ...bareInput, fontSize: big ? 28 : 15, fontWeight: big ? 700 : 500, fontFamily: big ? "'Space Grotesk', sans-serif" : "inherit" }} />
+        {suffix && <span style={{ color: C.dim, fontSize: 15, marginLeft: 4 }}>{suffix}</span>}
+      </div>
+    </label>
+  );
+}
+function Row({ label, value, sub, bold }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "5px 0" }}>
+      <span style={{ fontSize: sub ? 12.5 : 14, color: sub ? C.faint : C.dim, paddingLeft: sub ? 12 : 0 }}>{label}</span>
+      <span style={{ fontSize: bold ? 16 : 14, fontWeight: bold ? 700 : 500, color: bold ? C.text : C.dim, fontFamily: bold ? "'Space Grotesk', sans-serif" : "inherit" }}>{value}</span>
+    </div>
+  );
+}
+function Stat({ label, value }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em", color: C.faint }}>{label}</div>
+      <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 22, fontWeight: 700 }}>{value}</div>
+    </div>
+  );
+}
+function FlowRow({ label, value, positive, bold }) {
+  const col = bold ? (value >= 0 ? C.green : C.red) : value >= 0 ? C.dim : C.red;
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0" }}>
+      <span style={{ fontSize: bold ? 15 : 13.5, color: bold ? C.text : C.dim, fontWeight: bold ? 600 : 400 }}>{label}</span>
+      <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: bold ? 18 : 15, fontWeight: bold ? 700 : 500, color: col }}>
+        {value >= 0 ? "" : "–"}{money(Math.abs(value))}
+      </span>
+    </div>
+  );
+}
+function InsightTile({ label, value, sub }) {
+  return (
+    <div style={tile}>
+      <div style={tileLabel}>{label}</div>
+      <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, fontWeight: 700, letterSpacing: "-0.02em" }}>{value}</div>
+      <div style={{ fontSize: 11.5, color: C.faint, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sub}</div>
+    </div>
+  );
+}
+
+// ---- date helpers ----
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function monthOptions() {
+  const out = [];
+  const d = new Date();
+  for (let i = 0; i < 12; i++) {
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    d.setMonth(d.getMonth() - 1);
+  }
+  return out;
+}
+function monthLabel(key) {
+  const [y, mo] = key.split("-");
+  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${names[parseInt(mo, 10) - 1]} ${y}`;
+}
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function fmtDate(iso) {
+  if (!iso) return "";
+  const [y, mo, da] = iso.split("-");
+  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${parseInt(da, 10)} ${names[parseInt(mo, 10) - 1]}`;
+}
+
+// ===========================================================================
+// STYLES
+// ===========================================================================
+const page = { background: C.bg, color: C.text, minHeight: "100vh", fontFamily: "'Inter', system-ui, sans-serif" };
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+  * { box-sizing: border-box; }
+  input::placeholder { color: ${C.faint}; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: ${C.line}; border-radius: 4px; }
+  button { font-family: inherit; cursor: pointer; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid ${C.glow}; outline-offset: 2px; }
+  @media (max-width: 880px) {
+    .gg-shell { grid-template-columns: 1fr !important; }
+    .gg-grid2 { grid-template-columns: 1fr !important; }
+    .gg-grid3 { grid-template-columns: 1fr !important; }
+    .gg-grid4 { grid-template-columns: 1fr 1fr !important; }
+    .gg-saleform { grid-template-columns: 1fr 1fr !important; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+`;
+const header = {
+  display: "flex", justifyContent: "space-between", alignItems: "center",
+  padding: "18px 28px", borderBottom: `1px solid ${C.line}`,
+  position: "sticky", top: 0, background: C.bg + "F2", backdropFilter: "blur(8px)", zIndex: 10, flexWrap: "wrap", gap: 12,
+};
+const logoMark = {
+  width: 38, height: 38, borderRadius: 11, display: "flex", alignItems: "center", justifyContent: "center",
+  background: `linear-gradient(135deg, ${C.glow}, ${C.glow2})`,
+};
+const shell = { display: "grid", gridTemplateColumns: "minmax(0,1fr) 320px", gap: 24, padding: 28, maxWidth: 1280, margin: "0 auto" };
+const tabBtn = (active) => ({
+  padding: "9px 16px", borderRadius: 9, border: "none", fontSize: 13.5, fontWeight: 600,
+  background: active ? C.glow + "1A" : "transparent", color: active ? C.glow : C.dim,
+  transition: "all .15s",
+});
+const card = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: 20 };
+const cardTag = (bg, col) => ({
+  display: "inline-block", fontSize: 10.5, letterSpacing: "0.1em", fontWeight: 700,
+  color: col, background: bg, padding: "5px 10px", borderRadius: 7, marginBottom: 16, textTransform: "uppercase",
+});
+const fieldLabel = { display: "block", fontSize: 12, color: C.dim, marginBottom: 6, fontWeight: 500 };
+const input = { width: "100%", background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", color: C.text, fontSize: 14, marginBottom: 12 };
+const bareInput = { flex: 1, background: "transparent", border: "none", color: C.text, padding: "8px 0", width: "100%", outline: "none" };
+const verdict = {
+  display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16,
+  border: "1px solid", borderRadius: 16, padding: "22px 24px", marginTop: 18,
+};
+const signal = {
+  width: 48, height: 48, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
+  color: C.bg, fontWeight: 800, fontSize: 22, flexShrink: 0,
+};
+const primaryBtn = { background: C.glow, color: C.bg, border: "none", borderRadius: 10, padding: "11px 20px", fontWeight: 700, fontSize: 14 };
+const ghostBtn = { background: "transparent", color: C.dim, border: `1px solid ${C.line}`, borderRadius: 10, padding: "11px 18px", fontWeight: 600, fontSize: 14 };
+const suggestBtn = { width: "100%", background: C.glow2 + "1A", color: C.glow2, border: `1px solid ${C.glow2}44`, borderRadius: 10, padding: "11px", fontWeight: 600, fontSize: 13.5, marginTop: 4 };
+const hint = { fontSize: 12.5, color: C.faint, lineHeight: 1.6, marginTop: 18, maxWidth: 640 };
+const notesPanel = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: 20, alignSelf: "start", position: "sticky", top: 92 };
+const asideTitle = { fontFamily: "'Space Grotesk', sans-serif", fontSize: 16, fontWeight: 700, margin: 0 };
+const miniBtn = { background: C.glow, color: C.bg, border: "none", borderRadius: 9, padding: "0 16px", fontWeight: 700, fontSize: 13 };
+const noteCard = (done) => ({ display: "flex", alignItems: "flex-start", gap: 10, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", opacity: done ? 0.6 : 1 });
+const checkBox = (done) => ({ width: 20, height: 20, borderRadius: 6, border: `1.5px solid ${done ? C.green : C.faint}`, background: done ? C.green : "transparent", color: C.bg, fontSize: 12, fontWeight: 800, flexShrink: 0, lineHeight: 1, padding: 0 });
+const xBtn = { background: "transparent", border: "none", color: C.faint, fontSize: 18, lineHeight: 1, padding: 0, flexShrink: 0 };
+const emptyNote = { fontSize: 13, color: C.faint, textAlign: "center", padding: "20px 0" };
+const prodRow = { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: "14px 18px" };
+const stepBtn = { width: 30, height: 30, borderRadius: 8, border: `1px solid ${C.line}`, background: C.panel2, color: C.text, fontSize: 18, fontWeight: 700, lineHeight: 1 };
+const iconBtn = { background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "6px 10px", color: C.dim, fontSize: 12, fontWeight: 600 };
+const heroCard = { display: "flex", justifyContent: "space-between", alignItems: "center", background: `linear-gradient(135deg, ${C.panel}, ${C.panel2})`, border: "1px solid", borderRadius: 18, padding: "26px 28px" };
+const tile = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: 18 };
+const tileLabel = { fontSize: 12, color: C.dim, marginBottom: 8, fontWeight: 500 };
+const tileInput = { flex: 1, background: "transparent", border: "none", color: C.text, fontSize: 26, fontWeight: 700, fontFamily: "'Space Grotesk', sans-serif", outline: "none", width: "100%" };
+const select = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 14px", color: C.text, fontSize: 13.5, fontWeight: 600 };
+const formControl = { width: "100%", background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 11px", color: C.text, fontSize: 13.5, height: 40, outline: "none" };
+const saleRow = { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "10px 14px" };
+const expRow = { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 12, padding: "9px 14px" };
+const pill = { fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 20, border: "1px solid", whiteSpace: "nowrap" };
+const calloutBox = { border: "1px solid", borderRadius: 12, padding: "14px 16px", marginTop: 16, fontSize: 13, lineHeight: 1.6 };
+const chip = { background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 20, padding: "6px 13px", color: C.dim, fontSize: 12.5, fontWeight: 600 };
+const chipOn = { background: C.glow2 + "22", border: `1px solid ${C.glow2}66`, color: C.glow2 };
+
+
+// ---- mount ----
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(<App />);
+</script>
+</body>
+</html>
